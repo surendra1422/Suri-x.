@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SURI-X Hand Gesture LED Controller</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,Arial,sans-serif}
+body{margin:0;background:#101318;color:#f5f7fa}
+main{max-width:760px;margin:auto;padding:18px}
+h1{font-size:1.5rem;margin-bottom:6px}p{color:#b8c0cc;line-height:1.45}
+button{border:0;border-radius:12px;padding:12px 15px;margin:5px 5px 5px 0;font-weight:700;background:#e8edf5;color:#111;cursor:pointer}
+button:disabled{opacity:.45}
+#status{padding:12px;border:1px solid #3b424d;border-radius:12px;margin:12px 0}
+.stage{position:relative;background:#050608;border-radius:16px;overflow:hidden;min-height:220px}
+video{display:block;width:100%;transform:scaleX(-1)}
+canvas{position:absolute;inset:0;width:100%;height:100%;transform:scaleX(-1)}
+#count{font-size:2.2rem;font-weight:800}
+.leds{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+.led{width:46px;height:46px;border-radius:50%;background:#303640;border:2px solid #5b6471}
+.led.on{background:#69ff87;box-shadow:0 0 18px #48ff73}
+.small{font-size:.9rem}
+</style>
+</head>
+<body>
+<main>
+<h1>SURI-X · AI Hand Gesture LED Controller</h1>
+<p>Show one hand to the camera. The number of raised fingers controls how many LEDs turn on.</p>
+<div>
+<button id="connect">1 · Connect to SURI-X-LED</button>
+<button id="start" disabled>2 · Start camera</button>
+<button id="stop" disabled>Stop camera</button>
+</div>
+<div id="status">Status: Not connected to ESP32.</div>
+<div class="stage"><video id="video" playsinline autoplay muted></video><canvas id="overlay"></canvas></div>
+<div id="count">Fingers: —</div>
+<div class="leds" aria-label="LED preview">
+<div class="led"></div><div class="led"></div><div class="led"></div><div class="led"></div><div class="led"></div>
+</div>
+<p class="small">If AI detection is slow, keep your hand well-lit, show your palm clearly, and keep the whole hand inside the frame.</p>
+<p class="small">Privacy: camera frames are processed in this browser; only the finger count (0–5) is sent to the ESP32.</p>
+</main>
+<script type="module">
+import { HandLandmarker, FilesetResolver, DrawingUtils }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const CHARACTERISTIC_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+const $ = id => document.getElementById(id);
+const statusEl = $("status"), video = $("video"), canvas = $("overlay");
+const ctx = canvas.getContext("2d");
+const countEl = $("count"), ledEls = [...document.querySelectorAll(".led")];
+let characteristic, stream, landmarker, running = false, lastSent = -1, lastVideoTime = -1, lastSendAt = 0;
+
+function status(s){ statusEl.textContent = "Status: " + s; }
+function showCount(n){
+  countEl.textContent = `Fingers: ${n}`;
+  ledEls.forEach((el,i)=>el.classList.toggle("on", i<n));
+}
+async function sendCount(n){
+  showCount(n);
+  const now = Date.now();
+  if (characteristic && (n !== lastSent || now-lastSendAt > 700)) {
+    try {
+      await characteristic.writeValue(new TextEncoder().encode(String(n)));
+      lastSent=n; lastSendAt=now;
+    } catch(e) { status("BLE write failed: " + e.message); }
+  }
+}
+$("connect").addEventListener("click", async()=>{
+  if (!("bluetooth" in navigator)) {
+    status("Web Bluetooth is not available. Use current Chrome on Android, over HTTPS.");
+    return;
+  }
+  try {
+    const device = await navigator.bluetooth.requestDevice({
+      filters:[{name:"SURI-X-LED"}], optionalServices:[SERVICE_UUID]
+    });
+    device.addEventListener("gattserverdisconnected",()=>{characteristic=null; $("start").disabled=true; status("ESP32 disconnected.");});
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+    $("start").disabled=false;
+    status("Connected to SURI-X-LED. Now start the camera.");
+  } catch(e) { status("BLE connection cancelled/failed: " + e.message); }
+});
+
+async function setupAI(){
+  if (!landmarker) {
+    status("Loading hand-tracking AI…");
+    const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    landmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",delegate:"GPU"},
+      runningMode:"VIDEO",numHands:1
+    });
+  }
+}
+function fingerCount(lm, handedness){
+  // Count four fingertips using their y-position versus the middle joint.
+  // Thumb uses x-position and handedness; mirrored video is only visual.
+  let n=0;
+  if (lm[8].y < lm[6].y) n++;
+  if (lm[12].y < lm[10].y) n++;
+  if (lm[16].y < lm[14].y) n++;
+  if (lm[20].y < lm[18].y) n++;
+  const label = handedness?.[0]?.categoryName || "Right";
+  const thumbExtended = label === "Right" ? lm[4].x < lm[3].x : lm[4].x > lm[3].x;
+  if (thumbExtended) n++;
+  return n;
+}
+function resizeCanvas(){
+  const r=video.getBoundingClientRect(), dpr=window.devicePixelRatio||1;
+  canvas.width=Math.max(1,Math.round(r.width*dpr)); canvas.height=Math.max(1,Math.round(r.height*dpr));
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+async function frame(){
+  if(!running) return;
+  if(video.readyState>=2 && video.currentTime!==lastVideoTime){
+    lastVideoTime=video.currentTime;
+    const result=landmarker.detectForVideo(video,performance.now());
+    resizeCanvas();
+    const w=canvas.clientWidth,h=canvas.clientHeight; ctx.clearRect(0,0,w,h);
+    if(result.landmarks?.length){
+      const lm=result.landmarks[0];
+      // Draw landmark points; mirrored along with video.
+      ctx.fillStyle="#62ff9b";
+      for(const p of lm){ctx.beginPath();ctx.arc(p.x*w,p.y*h,4,0,Math.PI*2);ctx.fill();}
+      const n=fingerCount(lm,result.handednesses?.[0]);
+      await sendCount(n);
+    } else {
+      await sendCount(0);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+$("start").addEventListener("click",async()=>{
+  try{
+    $("start").disabled=true;
+    await setupAI();
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:640},height:{ideal:480}},audio:false});
+    video.srcObject=stream; await video.play();
+    running=true; $("stop").disabled=false; status("Camera running. Show your hand.");
+    requestAnimationFrame(frame);
+  }catch(e){running=false;$("start").disabled=false;status("Camera/AI error: "+e.message+". Open this page over HTTPS and allow camera access.");}
+});
+$("stop").addEventListener("click",()=>{
+  running=false; if(stream)stream.getTracks().forEach(t=>t.stop()); stream=null;
+  ctx.clearRect(0,0,canvas.width,canvas.height); showCount(0); sendCount(0);
+  $("stop").disabled=true; $("start").disabled=!characteristic; status("Camera stopped.");
+});
+showCount(0);
+</script>
+</body>
+</html>
